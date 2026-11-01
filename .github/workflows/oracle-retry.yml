@@ -1,0 +1,78 @@
+name: oracle-retry
+
+# Runs the capacity retry loop for ~5h40m per job; the hourly schedule queues the
+# next job behind the running one (concurrency), so retries continue nonstop.
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: oracle-retry
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+  issues: write
+
+jobs:
+  retry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OCI CLI
+        run: pipx install oci-cli
+
+      - name: Configure OCI credentials
+        env:
+          OCI_USER: ${{ secrets.OCI_USER }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_TENANCY: ${{ secrets.OCI_COMPARTMENT }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+          OCI_API_KEY: ${{ secrets.OCI_API_KEY }}
+          SSH_PUBKEY: ${{ secrets.SSH_PUBKEY }}
+        run: |
+          mkdir -p ~/.oci && chmod 700 ~/.oci
+          printf '%s\n' "$OCI_API_KEY" > ~/.oci/oci_api_key.pem
+          printf '%s\n' "$SSH_PUBKEY" > ~/.oci/ssh.pub
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=$OCI_USER
+          fingerprint=$OCI_FINGERPRINT
+          tenancy=$OCI_TENANCY
+          region=$OCI_REGION
+          key_file=~/.oci/oci_api_key.pem
+          EOF
+          chmod 600 ~/.oci/*
+
+      - name: Retry until capacity
+        id: retry
+        env:
+          OCI_COMPARTMENT: ${{ secrets.OCI_COMPARTMENT }}
+          OCI_AD: ${{ secrets.OCI_AD }}
+          OCI_SUBNET: ${{ secrets.OCI_SUBNET }}
+          OCI_IMAGE: ${{ secrets.OCI_IMAGE }}
+          SSH_PUBKEY_FILE: /home/runner/.oci/ssh.pub
+          MAX_RUNTIME: '20400'
+        run: |
+          set +e
+          ./retry-create.sh
+          rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          # 0 = created, 10 = already exists, 20 = time budget used (next run continues)
+          [ $rc -eq 0 ] || [ $rc -eq 10 ] || [ $rc -eq 20 ]
+
+      - name: Stop retrying once the server exists
+        if: steps.retry.outputs.rc == '0' || steps.retry.outputs.rc == '10'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow disable oracle-retry.yml -R "$GITHUB_REPOSITORY"
+          if [ "${{ steps.retry.outputs.rc }}" = "0" ]; then
+            gh issue create -R "$GITHUB_REPOSITORY" \
+              --title "Oracle server created ✅" \
+              --body "The A1 instance is running. The workflow has been disabled. Get the IP from the Oracle console or \`oci compute instance list-vnics\`."
+          fi

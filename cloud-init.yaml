@@ -1,0 +1,45 @@
+#cloud-config
+# Paste this into "Advanced options → Initialization script" when creating the instance.
+# Target image: Canonical Ubuntu 24.04 (aarch64) on VM.Standard.A1.Flex
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - ca-certificates
+  - curl
+  - git
+  - htop
+  - fail2ban
+  - unattended-upgrades
+  - iptables-persistent
+
+write_files:
+  # Harden SSH: keys only, no root login
+  - path: /etc/ssh/sshd_config.d/99-hardening.conf
+    content: |
+      PasswordAuthentication no
+      PermitRootLogin no
+      KbdInteractiveAuthentication no
+
+runcmd:
+  # Oracle's Ubuntu image blocks everything except SSH in iptables, even if the
+  # VCN security list allows it. Open HTTP/HTTPS ahead of the REJECT rule.
+  - iptables -I INPUT 6 -m state --state NEW -p tcp --dport 80 -j ACCEPT
+  - iptables -I INPUT 6 -m state --state NEW -p tcp --dport 443 -j ACCEPT
+  - netfilter-persistent save
+
+  # 4 GB swap as a safety net for memory spikes
+  - fallocate -l 4G /swapfile
+  - chmod 600 /swapfile
+  - mkswap /swapfile
+  - swapon /swapfile
+  - echo '/swapfile none swap sw 0 0' >> /etc/fstab
+
+  # Docker (official repo, arm64)
+  - curl -fsSL https://get.docker.com | sh
+  - usermod -aG docker ubuntu
+  - systemctl enable --now docker
+
+  - systemctl enable --now fail2ban
+  - systemctl restart ssh
