@@ -11,6 +11,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 : "${OCI_COMPARTMENT:?}" "${OCI_AD:?}" "${OCI_SUBNET:?}" "${OCI_IMAGE:?}" "${SSH_PUBKEY_FILE:?}"
 NAME=${INSTANCE_NAME:-server-1}
 INTERVAL=${INTERVAL:-60}
+SIZES=${SIZES:-"2:12 1:6"}   # OCPU:GB, tried in order each attempt
 MAX_RUNTIME=${MAX_RUNTIME:-0}   # seconds; 0 = run forever
 
 export SUPPRESS_LABEL_WARNING=True PYTHONWARNINGS=ignore
@@ -35,39 +36,55 @@ while true; do
     exit 10
   fi
 
-  out=$(oci compute instance launch \
-    --compartment-id "$OCI_COMPARTMENT" \
-    --availability-domain "$OCI_AD" \
-    --display-name "$NAME" \
-    --shape VM.Standard.A1.Flex \
-    --shape-config '{"ocpus":2,"memoryInGBs":12}' \
-    --image-id "$OCI_IMAGE" \
-    --boot-volume-size-in-gbs 100 \
-    --subnet-id "$OCI_SUBNET" \
-    --assign-public-ip true \
-    --ssh-authorized-keys-file "$SSH_PUBKEY_FILE" \
-    --user-data-file "$DIR/cloud-init.yaml" \
-    --wait-for-state RUNNING --max-wait-seconds 600 2>&1)
-  rc=$?
+  # Try each size in order (2 OCPU/12 GB first, then 1/6); stop at the first that lands.
+  result=capacity
+  for size in $SIZES; do
+    ocpus=${size%%:*}; mem=${size##*:}
+    out=$(oci compute instance launch \
+      --compartment-id "$OCI_COMPARTMENT" \
+      --availability-domain "$OCI_AD" \
+      --display-name "$NAME" \
+      --shape VM.Standard.A1.Flex \
+      --shape-config "{\"ocpus\":$ocpus,\"memoryInGBs\":$mem}" \
+      --image-id "$OCI_IMAGE" \
+      --boot-volume-size-in-gbs 100 \
+      --subnet-id "$OCI_SUBNET" \
+      --assign-public-ip true \
+      --ssh-authorized-keys-file "$SSH_PUBKEY_FILE" \
+      --user-data-file "$DIR/cloud-init.yaml" \
+      --wait-for-state RUNNING --max-wait-seconds 600 2>&1)
+    rc=$?
 
-  if [ $rc -eq 0 ]; then
-    id=$(echo "$out" | sed -n 's/.*"id": "\(ocid1.instance[^"]*\)".*/\1/p' | head -1)
-    ip=$(oci compute instance list-vnics --instance-id "$id" --query 'data[0]."public-ip"' --raw-output 2>/dev/null)
-    [ -n "${GITHUB_ACTIONS:-}" ] && echo "::add-mask::$ip"
-    log "SUCCESS after $attempt attempts. Public IP: $ip"
-    echo "$ip" > "$DIR/public-ip.txt"
-    notify "Oracle server created!" "Public IP: $ip"
-    exit 0
-  elif echo "$out" | grep -qiE "out of (host )?capacity"; then
-    log "Attempt $attempt: out of capacity, retrying in ${INTERVAL}s"
-    sleep "$INTERVAL"
-  elif echo "$out" | grep -qiE "TooManyRequests|\"status\": 429"; then
-    log "Attempt $attempt: rate limited, backing off 180s"
-    sleep 180
-  else
-    log "Attempt $attempt: unexpected error — stopping:"
-    echo "$out"
-    notify "Oracle retry" "Retry script stopped on an error — check the log"
-    exit 1
-  fi
+    if [ $rc -eq 0 ]; then
+      result=success; break
+    elif echo "$out" | grep -qiE "out of (host )?capacity"; then
+      continue
+    elif echo "$out" | grep -qiE "TooManyRequests|\"status\": 429"; then
+      result=ratelimited; break
+    else
+      result=error; break
+    fi
+  done
+
+  case $result in
+    success)
+      id=$(echo "$out" | sed -n 's/.*"id": "\(ocid1.instance[^"]*\)".*/\1/p' | head -1)
+      ip=$(oci compute instance list-vnics --instance-id "$id" --query 'data[0]."public-ip"' --raw-output 2>/dev/null)
+      [ -n "${GITHUB_ACTIONS:-}" ] && echo "::add-mask::$ip"
+      log "SUCCESS after $attempt attempts with ${ocpus} OCPU / ${mem} GB. Public IP: $ip"
+      echo "$ip" > "$DIR/public-ip.txt"
+      notify "Oracle server created!" "${ocpus} OCPU / ${mem} GB — Public IP: $ip"
+      exit 0 ;;
+    capacity)
+      log "Attempt $attempt: out of capacity for all sizes ($SIZES), retrying in ${INTERVAL}s"
+      sleep "$INTERVAL" ;;
+    ratelimited)
+      log "Attempt $attempt: rate limited (at ${ocpus}/${mem}), backing off 180s"
+      sleep 180 ;;
+    *)
+      log "Attempt $attempt: unexpected error — stopping:"
+      echo "$out"
+      notify "Oracle retry" "Retry script stopped on an error — check the log"
+      exit 1 ;;
+  esac
 done

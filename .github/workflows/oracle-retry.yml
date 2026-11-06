@@ -1,10 +1,11 @@
 name: oracle-retry
 
-# Runs the capacity retry loop for ~5h40m per job; the hourly schedule queues the
-# next job behind the running one (concurrency), so retries continue nonstop.
+# Runs the capacity retry loop for ~5h30m per job, then dispatches the next run
+# itself so retries continue nonstop. The schedule is only a backup in case a run
+# dies without handing over (GitHub often skips scheduled runs, so it can't be relied on).
 on:
   schedule:
-    - cron: '0 * * * *'
+    - cron: '17 */2 * * *'
   workflow_dispatch:
 
 concurrency:
@@ -56,7 +57,7 @@ jobs:
           OCI_SUBNET: ${{ secrets.OCI_SUBNET }}
           OCI_IMAGE: ${{ secrets.OCI_IMAGE }}
           SSH_PUBKEY_FILE: /home/runner/.oci/ssh.pub
-          MAX_RUNTIME: '20400'
+          MAX_RUNTIME: '19800'
         run: |
           set +e
           ./retry-create.sh
@@ -76,3 +77,9 @@ jobs:
               --title "Oracle server created ✅" \
               --body "The A1 instance is running. The workflow has been disabled. Get the IP from the Oracle console or \`oci compute instance list-vnics\`."
           fi
+
+      - name: Hand over to the next run
+        if: steps.retry.outputs.rc == '20'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run oracle-retry.yml -R "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"
