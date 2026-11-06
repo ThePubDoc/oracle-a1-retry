@@ -58,6 +58,7 @@ jobs:
           OCI_IMAGE: ${{ secrets.OCI_IMAGE }}
           SSH_PUBKEY_FILE: /home/runner/.oci/ssh.pub
           MAX_RUNTIME: '19800'
+          SIZES: '1:6'   # 1 OCPU / 6 GB only; resize to 2/12 later from the console
         run: |
           set +e
           ./retry-create.sh
